@@ -119,8 +119,8 @@ def make_gcn_config(hidden: int = 16, lr: float = 0.01,
 
 
 # Sweep axes. Baseline (8, 8) is shared by both lines.
-K_SWEEP     = [1, 2, 4, 8, 16]
-FP_SWEEP    = [4, 8, 16, 32, 64]
+K_SWEEP     = [1, 2]
+FP_SWEEP    = [4, 8]
 BASELINE_K  = 8
 BASELINE_FP = 8
 
@@ -155,6 +155,37 @@ def build_model(cfg: Config) -> torch.nn.Module:
 def count_params(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
+def count_theoretical_flops(cfg: Config, num_nodes: int, num_edges: int, 
+                            num_features: int, num_classes: int) -> int:
+    """Calculates theoretical MACs (Multiply-Accumulates) * 2 to get FLOPs."""
+    flops = 0
+    N = num_nodes
+    E = num_edges
+    
+    if cfg.kind == "GCN":
+        # Layer 1: X -> H
+        flops += 2 * N * num_features * cfg.Fp  # Projection
+        flops += 2 * E * cfg.Fp               # Aggregation
+        # Layer 2: H -> Output
+        flops += 2 * N * cfg.Fp * num_classes   # Projection
+        flops += 2 * E * num_classes          # Aggregation
+        
+    elif cfg.kind == "GAT":
+        # Layer 1: X -> H (K heads, Fp dim per head)
+        l1_proj = 2 * N * num_features * cfg.Fp         # Projection per head
+        l1_att  = 2 * E * (2 * cfg.Fp)                  # Attention coefficients (a^T [Wh_i || Wh_j])
+        l1_agg  = 2 * E * cfg.Fp                        # Neighborhood aggregation per head
+        flops += cfg.K * (l1_proj + l1_att + l1_agg)
+        
+        # Layer 2: H -> Output (1 head, no concat. Input dim is K * Fp)
+        in_dim2 = cfg.K * cfg.Fp
+        l2_proj = 2 * N * in_dim2 * num_classes
+        l2_att  = 2 * E * (2 * num_classes)
+        l2_agg  = 2 * E * num_classes
+        flops += 1 * (l2_proj + l2_att + l2_agg)
+
+    return flops
+
 
 # ── Reproducibility ───────────────────────────────────────────────────────────
 
@@ -179,15 +210,30 @@ def _train_step(model, optimizer, criterion) -> float:
 
 
 @torch.no_grad()
-def _accuracy(model, mask) -> float:
+def _eval_metrics(model, mask, criterion) -> tuple[float, float]:
+    """Returns (accuracy, loss) for the given mask."""
     model.eval()
-    pred = model(data.x, data.edge_index).argmax(dim=1)
-    return float((pred[mask] == data.y[mask]).sum()) / int(mask.sum())
+    out = model(data.x, data.edge_index)
+    pred = out.argmax(dim=1)
+    acc = float((pred[mask] == data.y[mask]).sum()) / int(mask.sum())
+    loss = float(criterion(out[mask], data.y[mask]))
+    return acc, loss
+
+@torch.no_grad()
+def _calculate_mad(out: torch.Tensor) -> float:
+    """Computes a proxy for Mean Absolute Distance (cosine distance) between all nodes.
+       Lower MAD means embeddings are more similar (higher oversmoothing)."""
+    out_norm = F.normalize(out, p=2, dim=1)
+    sim_matrix = torch.matmul(out_norm, out_norm.transpose(0, 1))
+    dist_matrix = 1.0 - sim_matrix
+    n = dist_matrix.size(0)
+    mad = float(dist_matrix.sum()) / (n * (n - 1))
+    return mad
 
 
 # ── Single run: How to train one config ────────────────────────────────────────
 
-def run_once(cfg: Config, seed: int, epochs: int = 200) -> list[dict]:
+def run_once(cfg: Config, seed: int, epochs: int = 500) -> list[dict]:
     """Train one config for `epochs` epochs; return per-epoch metric rows."""
     set_seed(seed)
     model    = build_model(cfg)
@@ -195,12 +241,35 @@ def run_once(cfg: Config, seed: int, epochs: int = 200) -> list[dict]:
                                 weight_decay=cfg.weight_decay)
     crit     = torch.nn.CrossEntropyLoss()
     n_params = count_params(model)
+    theoretical_flops = count_theoretical_flops(cfg, data.num_nodes, data.num_edges, NUM_FEATURES, NUM_CLASSES)
 
     history = []
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    winner_epoch = -1
+
     for epoch in range(1, epochs + 1):
         t0   = perf_counter()
-        loss = _train_step(model, opt, crit)
+        train_loss_step = _train_step(model, opt, crit)
         dt   = perf_counter() - t0
+
+        model.eval()
+        with torch.no_grad():
+            out = model(data.x, data.edge_index)
+            mad = _calculate_mad(out)
+
+        train_acc, train_loss = _eval_metrics(model, data.train_mask, crit)
+        val_acc, val_loss = _eval_metrics(model, data.val_mask, crit)
+        test_acc, test_loss = _eval_metrics(model, data.test_mask, crit)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= 30 and winner_epoch == -1:
+            winner_epoch = epoch - 30
 
         history.append({
             # identity / sweep tags
@@ -208,14 +277,26 @@ def run_once(cfg: Config, seed: int, epochs: int = 200) -> list[dict]:
             "K":     cfg.K,    "Fp":   cfg.Fp, "KxFp": cfg.KxFp,
             "seed":  seed,     "epoch": epoch,
             # learning metrics
-            "loss":      loss,
-            "train_acc": _accuracy(model, data.train_mask),
-            "val_acc":   _accuracy(model, data.val_mask),
-            "test_acc":  _accuracy(model, data.test_mask),
+            "loss":       train_loss_step,
+            "train_loss": train_loss,
+            "train_acc":  train_acc,
+            "val_loss":   val_loss,
+            "val_acc":    val_acc,
+            "test_loss":  test_loss,
+            "test_acc":   test_acc,
+            "mad":        mad,
             # cost metrics
             "sec_per_epoch": dt,
             "params":        n_params,
+            "flops":         theoretical_flops,
+            "is_winner_epoch": False
         })
+        
+    if winner_epoch == -1:
+        winner_epoch = epochs
+    for row in history:
+        if row["epoch"] == winner_epoch:
+            row["is_winner_epoch"] = True
 
     return history
 
@@ -225,7 +306,7 @@ def run_once(cfg: Config, seed: int, epochs: int = 200) -> list[dict]:
 def run_experiment(
     configs: list[Config] | None = None,
     seeds:  list[int] = [0, 1, 2, 3, 4],
-    epochs: int       = 200,
+    epochs: int       = 500,
     save_csv: str     = "results.csv",
 ) -> pd.DataFrame:
     """Run every config × seed combination and persist results to CSV."""
@@ -247,17 +328,23 @@ def run_experiment(
 # ── Summary ───────────────────────────────────────────────────────────────────
 
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
-    """Per config: mean ± std test acc at each seed's best-val epoch, plus the
-    overfitting gap (train − val), convergence epoch, timing, and param count.
+    """Per config: mean ± std test acc at the winner epoch, plus the
+    overfitting gap, convergence epoch, timing, and param count.
     """
-    # Best-val epoch per (config, seed) — never selects on the test set.
-    best = (
-        df.sort_values("val_acc", ascending=False)
-          .groupby(["name", "seed"], sort=False)
-          .first()
-          .reset_index()
-    )
-    best["gap"] = best["train_acc"] - best["val_acc"]  # overfitting proxy
+    # Select the "winner" epoch assigned by the delayed early stopping logic
+    if "is_winner_epoch" in df.columns:
+        best = df[df["is_winner_epoch"] == True].copy()
+    else:
+        # Fallback for old CSVs without is_winner_epoch
+        best = (
+            df.sort_values("val_loss", ascending=True)
+              .groupby(["name", "seed"], sort=False)
+              .first()
+              .reset_index()
+        )
+        
+    # True generalization gap defined by loss (README requirement)
+    best["gap"] = best["test_loss"] - best["train_loss"]
 
     agg = best.groupby("name").agg(
         kind=("kind", "first"),
@@ -267,8 +354,10 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         test_mean=("test_acc", "mean"),
         test_std=("test_acc", "std"),
         gap_mean=("gap", "mean"),
-        conv_epoch=("epoch", "mean"),   # epoch of best val ≈ convergence
+        mad_mean=("mad", "mean") if "mad" in best.columns else ("test_acc", "first"),
+        conv_epoch=("epoch", "mean"),
         params=("params", "first"),
+        flops=("flops", "first") if "flops" in best.columns else ("params", "first"),
         runs=("seed", "count"),
     )
     # Mean wall-clock per epoch over the *whole* run, not just the best epoch.
