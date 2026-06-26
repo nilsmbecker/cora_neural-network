@@ -119,8 +119,8 @@ def make_gcn_config(hidden: int = 16, lr: float = 0.01,
 
 
 # Sweep axes. Baseline (8, 8) is shared by both lines.
-K_SWEEP     = [1, 2]
-FP_SWEEP    = [4, 8]
+K_SWEEP     = [1, 2, 4, 8, 16]
+FP_SWEEP    = [4, 8, 16, 32, 64]
 BASELINE_K  = 8
 BASELINE_FP = 8
 
