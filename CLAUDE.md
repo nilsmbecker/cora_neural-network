@@ -54,27 +54,40 @@ With multi-head attention (K heads), intermediate layers concatenate head output
 
 ---
 
-## Current Implementation (`main.ipynb`)
+## Current Implementation
 
-The notebook has two models:
+All training logic lives in `experiment.py` (not the notebook). The notebook (`main.ipynb`) is visualization-only.
 
-**GCN baseline** (standard graph convolution, no attention):
+**GCN baseline** (`experiment.py: class GCN`):
 - 2 layers, hidden_channels=16, dropout=0.5
-- Used as a reference point
 
-**GAT implementation** (the focus of the experiment):
-```python
-class GAT(torch.nn.Module):
-    def __init__(self, hidden_channels, heads):
-        self.conv1 = GATConv(dataset.num_features, hidden_channels, heads)
-        self.conv2 = GATConv(heads * hidden_channels, dataset.num_classes, heads)
-```
+**GAT** (`experiment.py: class GAT`):
+- Layer 1: `GATConv(1433, F', heads=K, concat=True)` → K×F' output
+- Layer 2: `GATConv(K×F', 7, heads=1, concat=False)` → 7-dim averaged output (correctly fixed)
+- Dropout=0.6 on input and between layers
 
-**Known issue in current code:** `conv2` passes `heads` to the final layer, which with `concat=True` (PyG default) produces `heads * num_classes` output dimensions instead of `num_classes`. For the experiment, the final layer should use `concat=False` (averaging) to correctly output `num_classes=7`. Fix:
+**Metrics collected per epoch × seed × config** (`run_once`):
+- `train_acc`, `val_acc`, `test_acc`, `train_loss`, `val_loss`, `test_loss`
+- `mad` — Mean Absolute Distance (oversmoothing proxy)
+- `sec_per_epoch`, `params`, `flops` (theoretical)
+- `is_winner_epoch` — best val_acc epoch flag (used by `summarize`)
+
+**Sweep state** (`experiment.py: K_SWEEP / FP_SWEEP`):
 ```python
-self.conv2 = GATConv(heads * hidden_channels, dataset.num_classes, heads=1, concat=False)
+K_SWEEP  = [1, 2]        # ← INCOMPLETE: should be [1, 2, 4, 8, 16]
+FP_SWEEP = [4, 8]        # ← INCOMPLETE: should be [4, 8, 16, 32, 64]
 ```
-Or equivalently keep multiple heads with averaging on the final layer.
+Current `output/results.csv` has 5 configs: GCN_H16, GAT_K1_F8, GAT_K2_F8, GAT_K8_F4, GAT_K8_F8.
+Missing: GAT_K4_F8, GAT_K16_F8, GAT_K8_F16, GAT_K8_F32, GAT_K8_F64.
+
+**To run the full sweep:**
+```python
+# In experiment.py, change:
+K_SWEEP  = [1, 2, 4, 8, 16]
+FP_SWEEP = [4, 8, 16, 32, 64]
+# Then:
+python experiment.py   # ≈10 min, outputs output/results.csv
+```
 
 **Data loading:** The automatic PyG download fails. `cora_setup.py` handles this by downloading raw files from GitHub and placing them where PyG expects. Run setup first.
 
@@ -182,10 +195,12 @@ The notebook already includes a GCN baseline. The analysis should produce a comp
 
 | File | Purpose |
 |---|---|
-| `main.ipynb` | Main notebook — GCN baseline + GAT implementation + training loop |
+| `experiment.py` | All training logic — models, sweep configs, metrics, `run_experiment()` |
+| `main.ipynb` | Visualization notebook — loads `output/results.csv` and plots all figures |
 | `cora_setup.py` | Downloads Cora raw files and loads via PyG Planetoid |
 | `data/Planetoid/Cora/` | Dataset files (raw + processed) |
-| `gat_loss.png` | Saved accuracy curves from last run |
+| `output/results.csv` | Experiment results (one row per epoch × seed × config) |
+| `output/*.png` | Saved figures: sweep curves, overfitting gap, cost, t-SNE |
 
 ---
 
