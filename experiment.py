@@ -307,7 +307,7 @@ def run_experiment(
     configs: list[Config] | None = None,
     seeds:  list[int] = [0, 1, 2, 3, 4],
     epochs: int       = 500,
-    save_csv: str     = "results.csv",
+    save_csv: str     = "output/results.csv",
 ) -> pd.DataFrame:
     """Run every config × seed combination and persist results to CSV."""
     if configs is None:
