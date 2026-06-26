@@ -353,6 +353,8 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         KxFp=("KxFp", "first"),
         test_mean=("test_acc", "mean"),
         test_std=("test_acc", "std"),
+        train_mean=("train_acc", "mean"),
+        val_mean=("val_acc", "mean"),
         gap_mean=("gap", "mean"),
         mad_mean=("mad", "mean") if "mad" in best.columns else ("test_acc", "first"),
         conv_epoch=("epoch", "mean"),
